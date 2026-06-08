@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-AeroIO 是一个基于 Go 标准库从零构建的网络协议栈教学项目，涵盖以下四个递进阶段：
+AeroIO 是一个基于 Go 标准库从零构建的网络协议栈教学项目，涵盖以下五个递进阶段：
 
 | 阶段 | 模块 | 说明 |
 |------|------|------|
@@ -12,6 +12,7 @@ AeroIO 是一个基于 Go 标准库从零构建的网络协议栈教学项目，
 | Phase 2 | `aero/http` + `aero/websocket` | HTTP/1.1 协议解析 + RFC 6455 WebSocket 双栈服务器 |
 | Phase 3 | `aero/reactor` | Reactor 模式非阻塞 I/O 网络库 (epoll) |
 | Phase 4 | `aero/rpc` | 高性能 RPC 框架 (自定义协议 + 连接池 + 负载均衡) |
+| Phase 5 | `aero/tunnel` | 内网穿透 (TCP 直连 + 端口映射) |
 
 ## 快速开始
 
@@ -33,6 +34,12 @@ go run ./cmd/reactor/
 go run ./cmd/rpc/server/
 # 终端2: 运行 RPC 客户端
 go run ./cmd/rpc/client/
+
+# Phase 5: 内网穿透
+# 公网服务端 (VPS)
+go run ./cmd/tunnel/server/
+# 内网客户端
+go run ./cmd/tunnel/agent -server localhost:8888 -local 2222:localhost:22
 ```
 
 ## 架构设计
@@ -43,6 +50,13 @@ go run ./cmd/rpc/client/
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  ┌──────────────────────────────────────────────────┐   │
+│  │              Tunnel Framework                       │   │
+│  │   ┌──────────┐ ┌────────┐ ┌──────────────────┐   │   │
+│  │   │  Server  │ │ Client │ │ Port Forwarder    │   │   │
+│  │   └──────────┘ └────────┘ └──────────────────┘   │   │
+│  └──────────────────┬───────────────────────────────┘   │
+│                     │                                    │
+│  ┌──────────────────┴───────────────────────────────┐   │
 │  │                 RPC Framework                     │   │
 │  │   ┌──────────┐ ┌────────┐ ┌──────────────────┐   │   │
 │  │   │  Codec   │ │  Pool  │ │  Load Balancer   │   │   │
@@ -56,7 +70,7 @@ go run ./cmd/rpc/client/
 │  │              Reactor Network Library              │   │
 │  │   ┌─────────┐ ┌──────────┐ ┌──────────────────┐  │   │
 │  │   │  Poller │ │EventLoop │ │   TimerWheel     │  │   │
-│  │   │ (epoll) │ │(Reactor) │ │   BufferPool     │  │   │
+│  │   │ (epoll) │ │(Reactor) │ │   BufferPool    │  │   │
 │  │   └─────────┘ └──────────┘ └──────────────────┘  │   │
 │  └──────────────────┬───────────────────────────────┘   │
 │                     │                                    │
@@ -88,17 +102,21 @@ AeroIO/
 │   ├── helloserver/            # Phase 1 演示
 │   ├── httpserver/             # Phase 2 演示
 │   ├── reactor/                # Phase 3 演示
-│   └── rpc/                    # Phase 4 演示
-│       ├── server/
-│       └── client/
+│   ├── rpc/                    # Phase 4 演示
+│   │   ├── server/
+│   │   └── client/
+│   └── tunnel/                 # Phase 5 演示
+│       ├── server/            # 公网服务端
+│       └── agent/              # 内网客户端
 ├── aero/                       # 核心库代码
 │   ├── tcp/                    # TCP 服务端框架
 │   ├── http/                   # HTTP/1.1 协议实现
 │   ├── websocket/              # WebSocket RFC 6455 实现
 │   ├── reactor/                # Reactor 网络库
-│   └── rpc/                    # RPC 框架
-│       ├── codec/              # 编解码接口
-│       └── protocol/           # 自定义 RPC 协议
+│   ├── rpc/                    # RPC 框架
+│   │   ├── codec/              # 编解码接口
+│   │   └── protocol/           # 自定义 RPC 协议
+│   └── tunnel/                 # 内网穿透框架
 ├── docs/                       # 详细设计文档
 └── test/                       # 集成测试
 ```
@@ -176,6 +194,90 @@ AeroIO/
 
 **核心代码路径**: `aero/rpc/protocol/message.go`, `aero/rpc/client.go`
 
+### Phase 5: 内网穿透 (Tunnel)
+
+基于 TCP 直连的内网穿透解决方案，无需公网 IP 即可访问内网服务。
+
+**架构图**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Public Server (VPS)                     │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │              Tunnel Server (:8888)                    │  │
+│  │  ┌───────────┐ ┌────────────┐ ┌──────────────────┐  │  │
+│  │  │ Session   │ │  Port      │ │  Channel        │  │  │
+│  │  │ Manager   │ │  Registry  │ │  Multiplexer    │  │  │
+│  │  └───────────┘ └────────────┘ └──────────────────┘  │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                              │                              │
+│                   Public Port (:2222)                       │
+└──────────────────────────────│───────────────────────────────┘
+                               │
+                         TCP Tunnel
+                               │
+┌──────────────────────────────│───────────────────────────────┐
+│                   Private Network                            │
+│                              │                               │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │              Tunnel Agent                             │   │
+│  │  ┌───────────┐ ┌────────────┐ ┌──────────────────┐  │   │
+│  │  │  Client   │ │   Local    │ │   Heartbeat     │  │   │
+│  │  │  Connect  │ │   Proxy    │ │   Manager       │  │   │
+│  │  └───────────┘ └────────────┘ └──────────────────┘  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                              │                              │
+│                    Local Service (SSH:22)                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**隧道协议**:
+
+```
+┌────────┬────────┬────────────────┬───────────┬───────────┐
+│ Magic  │ Type   │ ChannelID       │ Length    │ Payload   │
+│ 2B     │ 1B     │ 8B             │ 4B        │ N         │
+└────────┴────────┴────────────────┴───────────┴───────────┘
+```
+
+**消息类型**:
+| 类型 | 值 | 说明 |
+|------|-----|------|
+| MsgRegister | 0x01 | Agent 注册 |
+| MsgOpenPort | 0x02 | 请求开放端口 |
+| MsgClosePort | 0x03 | 关闭端口 |
+| MsgData | 0x04 | 数据转发 |
+| MsgHeartbeat | 0x05 | 心跳保活 |
+| MsgAck | 0x06 | 确认响应 |
+| MsgError | 0x07 | 错误响应 |
+
+**核心特性**:
+- **TCP 直连**: 低延迟，无需 HTTP 包装
+- **通道复用**: 单 TCP 连接支持多端口转发
+- **心跳保活**: 30s 间隔检测，断线自动重连
+- **会话管理**: Session 超时自动清理
+- **端口池**: 10000-60000 动态端口分配
+
+**使用示例**:
+
+```bash
+# 1. 启动公网服务端 (VPS)
+go run ./cmd/tunnel/server -addr :8888
+
+# 2. 启动内网客户端
+# 暴露 SSH 服务
+go run ./cmd/tunnel/agent -server your-vps.com:8888 -local 2222:localhost:22
+
+# 暴露多个端口
+go run ./cmd/tunnel/agent -server your-vps.com:8888 -map 2222:localhost:22,8080:localhost:8080,3306:localhost:3306
+
+# 3. 通过公网访问内网服务
+ssh -p 2222 user@your-vps.com
+curl http://your-vps.com:8080
+```
+
+**核心代码路径**: `aero/tunnel/server.go`, `aero/tunnel/client.go`, `cmd/tunnel/`
+
 ## 运行测试
 
 ```bash
@@ -185,7 +287,7 @@ go test ./test/ -v
 ## 设计约束
 
 - **零第三方依赖**: 仅使用 Go 标准库 (`net`, `syscall`, `sync`, `reflect`, `encoding/gob`, `crypto/sha1` 等)
-- **手写协议**: HTTP/1.1 和 WebSocket 帧均手动解析，不使用 `net/http`
+- **手写协议**: HTTP/1.1、WebSocket、RPC、隧道协议均手动实现
 - **生产级特性**: 超时控制、优雅关闭、连接池、buffer 复用、panic 恢复
 
 ## 许可
