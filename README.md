@@ -12,7 +12,7 @@ AeroIO 是一个基于 Go 标准库从零构建的网络协议栈教学项目，
 | Phase 2 | `aero/http` + `aero/websocket` | HTTP/1.1 协议解析 + RFC 6455 WebSocket 双栈服务器 |
 | Phase 3 | `aero/reactor` | Reactor 模式非阻塞 I/O 网络库 (epoll) |
 | Phase 4 | `aero/rpc` | 高性能 RPC 框架 (自定义协议 + 连接池 + 负载均衡) |
-| Phase 5 | `aero/tunnel` | 内网穿透 (TCP 直连 + 端口映射) |
+| Phase 5 | `aero/tunnel` | 内网穿透 (TCP + WebSocket + 压缩 + 认证) |
 
 ## 快速开始
 
@@ -37,9 +37,9 @@ go run ./cmd/rpc/client/
 
 # Phase 5: 内网穿透
 # 公网服务端 (VPS)
-go run ./cmd/tunnel/server/
+go run ./cmd/tunnel/server -token mytoken -compress -transport both
 # 内网客户端
-go run ./cmd/tunnel/agent -server localhost:8888 -local 2222:localhost:22
+go run ./cmd/tunnel/agent -server your-vps.com:8888 -token mytoken -transport both -local 2222:localhost:22
 ```
 
 ## 架构设计
@@ -53,7 +53,11 @@ go run ./cmd/tunnel/agent -server localhost:8888 -local 2222:localhost:22
 │  │              Tunnel Framework                       │   │
 │  │   ┌──────────┐ ┌────────┐ ┌──────────────────┐   │   │
 │  │   │  Server  │ │ Client │ │ Port Forwarder    │   │   │
+│  │   │ (TCP/WS) │ │(TCP/WS)│ │ (HTTP Proxy)     │   │   │
 │  │   └──────────┘ └────────┘ └──────────────────┘   │   │
+│  │   ┌──────────────────────────────────────────┐   │   │
+│  │   │  Compression │ Auth │ Session Manager    │   │   │
+│  │   └──────────────────────────────────────────┘   │   │
 │  └──────────────────┬───────────────────────────────┘   │
 │                     │                                    │
 │  ┌──────────────────┴───────────────────────────────┐   │
@@ -61,16 +65,13 @@ go run ./cmd/tunnel/agent -server localhost:8888 -local 2222:localhost:22
 │  │   ┌──────────┐ ┌────────┐ ┌──────────────────┐   │   │
 │  │   │  Codec   │ │  Pool  │ │  Load Balancer   │   │   │
 │  │   └──────────┘ └────────┘ └──────────────────┘   │   │
-│  │   ┌──────────────────────────────────────────┐   │   │
-│  │   │         Custom Binary Protocol            │   │   │
-│  │   └──────────────────────────────────────────┘   │   │
 │  └──────────────────┬───────────────────────────────┘   │
 │                     │                                    │
 │  ┌──────────────────┴───────────────────────────────┐   │
 │  │              Reactor Network Library              │   │
 │  │   ┌─────────┐ ┌──────────┐ ┌──────────────────┐  │   │
 │  │   │  Poller │ │EventLoop │ │   TimerWheel     │  │   │
-│  │   │ (epoll) │ │(Reactor) │ │   BufferPool    │  │   │
+│  │   │ (epoll) │ │(Reactor) │ │   BufferPool     │  │   │
 │  │   └─────────┘ └──────────┘ └──────────────────┘  │   │
 │  └──────────────────┬───────────────────────────────┘   │
 │                     │                                    │
@@ -107,7 +108,8 @@ AeroIO/
 │   │   └── client/
 │   └── tunnel/                 # Phase 5 演示
 │       ├── server/            # 公网服务端
-│       └── agent/              # 内网客户端
+│       ├── agent/              # 内网客户端
+│       └── wsserver/           # WebSocket 服务端
 ├── aero/                       # 核心库代码
 │   ├── tcp/                    # TCP 服务端框架
 │   ├── http/                   # HTTP/1.1 协议实现
@@ -117,6 +119,9 @@ AeroIO/
 │   │   ├── codec/              # 编解码接口
 │   │   └── protocol/           # 自定义 RPC 协议
 │   └── tunnel/                 # 内网穿透框架
+│       ├── ws/                 # WebSocket 传输层
+│       ├── compress.go          # 流量压缩
+│       └── http_proxy.go        # HTTP 反向代理
 ├── docs/                       # 详细设计文档
 └── test/                       # 集成测试
 ```
@@ -196,7 +201,7 @@ AeroIO/
 
 ### Phase 5: 内网穿透 (Tunnel)
 
-基于 TCP 直连的内网穿透解决方案，无需公网 IP 即可访问内网服务。
+基于 TCP/WebSocket 的内网穿透解决方案，支持多种传输模式和增强功能。
 
 **架构图**:
 
@@ -204,40 +209,45 @@ AeroIO/
 ┌─────────────────────────────────────────────────────────────┐
 │                      Public Server (VPS)                     │
 │  ┌─────────────────────────────────────────────────────┐  │
-│  │              Tunnel Server (:8888)                    │  │
+│  │              Tunnel Server (:8888/:8889)               │  │
 │  │  ┌───────────┐ ┌────────────┐ ┌──────────────────┐  │  │
 │  │  │ Session   │ │  Port      │ │  Channel        │  │  │
 │  │  │ Manager   │ │  Registry  │ │  Multiplexer    │  │  │
 │  │  └───────────┘ └────────────┘ └──────────────────┘  │  │
+│  │  ┌───────────┐ ┌────────────┐ ┌──────────────────┐  │  │
+│  │  │ Compression│ │  Auth     │ │  HTTP Proxy     │  │  │
+│  │  │  (gzip)   │ │ (Token)    │ │  (VHost路由)    │  │  │
+│  │  └───────────┘ └────────────┘ └──────────────────┘  │  │
 │  └─────────────────────────────────────────────────────┘  │
 │                              │                              │
-│                   Public Port (:2222)                       │
-└──────────────────────────────│───────────────────────────────┘
+│              ┌───────────────┴───────────────┐            │
+│              │   TCP (:8888)  │  WS (:8889)   │            │
+│              └───────────────────────────────┘              │
+└─────────────────────────────────────────────────────────────┘
                                │
-                         TCP Tunnel
+                         Tunnel (TCP/WS)
                                │
 ┌──────────────────────────────│───────────────────────────────┐
 │                   Private Network                            │
-│                              │                               │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │              Tunnel Agent                             │   │
 │  │  ┌───────────┐ ┌────────────┐ ┌──────────────────┐  │   │
-│  │  │  Client   │ │   Local    │ │   Heartbeat     │  │   │
-│  │  │  Connect  │ │   Proxy    │ │   Manager       │  │   │
+│  │  │ TCP/WS    │ │   Local    │ │   Heartbeat     │  │   │
+│  │  │ Client    │ │   Proxy    │ │   Manager       │  │   │
 │  │  └───────────┘ └────────────┘ └──────────────────┘  │   │
 │  └─────────────────────────────────────────────────────┘   │
-│                              │                              │
-│                    Local Service (SSH:22)                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **隧道协议**:
 
 ```
-┌────────┬────────┬────────────────┬───────────┬───────────┐
-│ Magic  │ Type   │ ChannelID       │ Length    │ Payload   │
-│ 2B     │ 1B     │ 8B             │ 4B        │ N         │
-└────────┴────────┴────────────────┴───────────┴───────────┘
+┌────────┬────────┬────────────────┬───────────┬───────────┬────────────┐
+│ Magic  │ Type   │ ChannelID       │ Flags     │ Length    │ Payload   │
+│ 2B     │ 1B     │ 8B             │ 1B        │ 4B        │ N         │
+└────────┴────────┴────────────────┴───────────┴───────────┴────────────┘
+
+Flags: bit 0 = compressed (1 = gzip压缩, 0 = 原始数据)
 ```
 
 **消息类型**:
@@ -250,33 +260,52 @@ AeroIO/
 | MsgHeartbeat | 0x05 | 心跳保活 |
 | MsgAck | 0x06 | 确认响应 |
 | MsgError | 0x07 | 错误响应 |
+| MsgAuth | 0x09 | 认证令牌 |
 
 **核心特性**:
-- **TCP 直连**: 低延迟，无需 HTTP 包装
-- **通道复用**: 单 TCP 连接支持多端口转发
-- **心跳保活**: 30s 间隔检测，断线自动重连
-- **会话管理**: Session 超时自动清理
-- **端口池**: 10000-60000 动态端口分配
+
+| 特性 | 说明 |
+|------|------|
+| **双传输层** | TCP 直连 (低延迟) + WebSocket (适配受限网络) |
+| **通道复用** | 单连接支持多端口转发 |
+| **流量压缩** | gzip 压缩，减少带宽占用 |
+| **Token 认证** | 简单的令牌认证保护 |
+| **HTTP 反向代理** | Host 路由、X-Forwarded-For、WebSocket 穿透 |
+| **会话管理** | Session 超时自动清理 |
+| **端口池** | 10000-60000 动态端口分配 |
 
 **使用示例**:
 
 ```bash
-# 1. 启动公网服务端 (VPS)
-go run ./cmd/tunnel/server -addr :8888
+# 完整功能服务端
+go run ./cmd/tunnel/server -token mytoken -compress -transport both
 
-# 2. 启动内网客户端
-# 暴露 SSH 服务
-go run ./cmd/tunnel/agent -server your-vps.com:8888 -local 2222:localhost:22
+# 仅 TCP 模式
+go run ./cmd/tunnel/server -token mytoken -transport tcp
+
+# 仅 WebSocket 模式
+go run ./cmd/tunnel/server -token mytoken -transport websocket
+
+# Agent 端
+go run ./cmd/tunnel/agent -server your-vps.com:8888 -token mytoken -transport both -local 2222:localhost:22
 
 # 暴露多个端口
-go run ./cmd/tunnel/agent -server your-vps.com:8888 -map 2222:localhost:22,8080:localhost:8080,3306:localhost:3306
+go run ./cmd/tunnel/agent -server your-vps.com:8888 -token mytoken -map 2222:localhost:22,8080:localhost:8080,3306:localhost:3306
 
-# 3. 通过公网访问内网服务
+# 通过公网访问
 ssh -p 2222 user@your-vps.com
 curl http://your-vps.com:8080
 ```
 
-**核心代码路径**: `aero/tunnel/server.go`, `aero/tunnel/client.go`, `cmd/tunnel/`
+**HTTP 反向代理配置**:
+
+```go
+proxy := tunnel.NewHTTPProxy()
+proxy.AddVHost("app.example.com", "localhost:8080")
+proxy.AddVHost("api.example.com", "localhost:3000")
+```
+
+**核心代码路径**: `aero/tunnel/`, `cmd/tunnel/`
 
 ## 运行测试
 
@@ -286,7 +315,7 @@ go test ./test/ -v
 
 ## 设计约束
 
-- **零第三方依赖**: 仅使用 Go 标准库 (`net`, `syscall`, `sync`, `reflect`, `encoding/gob`, `crypto/sha1` 等)
+- **零第三方依赖**: 仅使用 Go 标准库 (`net`, `syscall`, `sync`, `reflect`, `encoding/gob`, `crypto/sha1`, `compress/flate` 等)
 - **手写协议**: HTTP/1.1、WebSocket、RPC、隧道协议均手动实现
 - **生产级特性**: 超时控制、优雅关闭、连接池、buffer 复用、panic 恢复
 
