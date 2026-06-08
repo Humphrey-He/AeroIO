@@ -100,6 +100,7 @@ func ClientWithAutoFallback(config TunnelConfig) (*Client, *WSTransport, error) 
 			wsConfig := WSTransportConfig{
 				ServerAddr: config.ServerAddr,
 				AgentID:    config.AgentID,
+				Token:      config.Token,
 				Timeout:    config.Timeout,
 				Heartbeat:  config.Heartbeat,
 				Path:       config.WSPath,

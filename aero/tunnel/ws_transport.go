@@ -18,6 +18,7 @@ import (
 type WSTransportConfig struct {
 	ServerAddr  string
 	AgentID     string
+	Token       string // Authentication token
 	Timeout     time.Duration
 	Heartbeat   time.Duration
 	Path        string // WebSocket path, default "/tunnel"
@@ -99,6 +100,35 @@ func (t *WSTransport) Connect() error {
 	t.encoder = NewEncoder(&wsWriter{conn: t.conn})
 	t.decoder = NewDecoder(&wsReader{conn: t.conn})
 	t.running = true
+
+	// Send auth message if token is configured
+	if t.config.Token != "" {
+		if err := t.encoder.Encode(NewAuthMessage(t.config.Token)); err != nil {
+			t.conn.Close()
+			t.running = false
+			return fmt.Errorf("failed to send auth: %w", err)
+		}
+
+		// Wait for auth response
+		resp, err := t.decoder.Decode()
+		if err != nil {
+			t.conn.Close()
+			t.running = false
+			return fmt.Errorf("failed to read auth response: %w", err)
+		}
+
+		if resp.Type == MsgError {
+			t.conn.Close()
+			t.running = false
+			return fmt.Errorf("auth failed: %s", string(resp.Payload))
+		}
+
+		if resp.Type != MsgAck {
+			t.conn.Close()
+			t.running = false
+			return fmt.Errorf("unexpected auth response: %d", resp.Type)
+		}
+	}
 
 	// Send registration
 	if err := t.encoder.Encode(NewRegisterMessage(t.sessionID)); err != nil {

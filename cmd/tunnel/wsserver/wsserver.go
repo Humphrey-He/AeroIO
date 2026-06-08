@@ -22,9 +22,10 @@ import (
 
 // Config holds the configuration for the WebSocket tunnel server
 type Config struct {
-	ListenAddr string
-	PortRange  [2]uint16
-	Timeout    time.Duration
+	ListenAddr  string
+	PortRange   [2]uint16
+	Timeout     time.Duration
+	AuthTokens  []string // Allowed authentication tokens
 }
 
 // Server represents a WebSocket tunnel server
@@ -166,6 +167,39 @@ func (s *Server) handleWSSession(conn net.Conn) {
 
 	var session *Session
 	stopCh := make(chan struct{})
+
+	// If auth tokens are configured, require authentication
+	if len(s.config.AuthTokens) > 0 {
+		frame, err := readWSFrame(conn)
+		if err != nil {
+			return
+		}
+
+		if frame.Opcode != 0x2 { // Binary frame
+			return
+		}
+
+		msgDecoder := tunnel.NewDecoder(&frameReader{data: frame.Payload})
+		msg, err := msgDecoder.Decode()
+		if err != nil {
+			return
+		}
+
+		if msg.Type != tunnel.MsgAuth {
+			s.writeMessage(conn, tunnel.NewErrorMessage(0, "authentication required"))
+			return
+		}
+
+		token := string(msg.Payload)
+		if !s.validateToken(token) {
+			log.Printf("[WSServer] Invalid authentication token from %s", conn.RemoteAddr())
+			s.writeMessage(conn, tunnel.NewErrorMessage(0, "invalid token"))
+			return
+		}
+
+		s.writeMessage(conn, tunnel.NewAckMessage(tunnel.ChannelIDControl))
+		log.Printf("[WSServer] Client authenticated from %s", conn.RemoteAddr())
+	}
 
 	go func() {
 		for {
@@ -421,3 +455,13 @@ func (s *Server) allocatePort() uint16 {
 
 // ChannelIDControl is exported for use in this package
 const ChannelIDControl = tunnel.ChannelIDControl
+
+// validateToken checks if the provided token is in the allowed list
+func (s *Server) validateToken(token string) bool {
+	for _, t := range s.config.AuthTokens {
+		if t == token {
+			return true
+		}
+	}
+	return false
+}

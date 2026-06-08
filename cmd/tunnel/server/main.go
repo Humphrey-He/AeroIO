@@ -105,6 +105,10 @@ func runWSServer(addr string) {
 		Timeout:    60 * time.Second,
 	}
 
+	if *flagToken != "" {
+		config.AuthTokens = []string{*flagToken}
+	}
+
 	server := wsserver.NewServer(config)
 
 	server.SetOnPortOpen(func(binding *wsserver.PortBinding) {

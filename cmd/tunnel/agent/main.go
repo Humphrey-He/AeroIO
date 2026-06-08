@@ -108,6 +108,11 @@ func main() {
 		fmt.Printf("🔐 Compression enabled\n")
 	}
 
+	// Show token status
+	if *flagToken != "" {
+		fmt.Printf("🔑 Authentication token configured\n")
+	}
+
 	fmt.Printf("🔌 Connecting to tunnel server %s (transport: %s)...\n", *flagServer, transportType)
 
 	var client *tunnel.Client

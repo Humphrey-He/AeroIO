@@ -7,7 +7,7 @@ import (
 )
 
 // Message type for compressed data
-const MsgCompress = 0x0A
+const MsgCompress = 0x08
 
 // Compression level constants
 const (
