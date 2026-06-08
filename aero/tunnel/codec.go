@@ -29,8 +29,11 @@ func (e *Encoder) Encode(msg *Message) error {
 	// ChannelID (8 bytes)
 	binary.BigEndian.PutUint64(header[3:11], msg.ChannelID)
 
-		// Length (4 bytes)
-	binary.BigEndian.PutUint32(header[11:15], uint32(len(msg.Payload)))
+	// Flags (1 byte)
+	header[11] = msg.Flags
+
+	// Length (4 bytes)
+	binary.BigEndian.PutUint32(header[12:16], uint32(len(msg.Payload)))
 
 	// Write header
 	if _, err := e.w.Write(header); err != nil {
@@ -73,9 +76,10 @@ func (d *Decoder) Decode() (*Message, error) {
 	msg := &Message{
 		Type:      header[2],
 		ChannelID: binary.BigEndian.Uint64(header[3:11]),
+		Flags:     header[11],
 	}
 
-	length := binary.BigEndian.Uint32(header[11:15])
+	length := binary.BigEndian.Uint32(header[12:16])
 	if length > 0 {
 		// Limit max payload size to 64KB
 		if length > 65536 {

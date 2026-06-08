@@ -12,10 +12,12 @@ import (
 
 // ServerConfig holds the configuration for a tunnel server
 type ServerConfig struct {
-	ListenAddr  string
-	PortRange   [2]uint16 // Min and max port for dynamic allocation
-	Timeout     time.Duration
-	Heartbeat   time.Duration
+	ListenAddr   string
+	PortRange    [2]uint16 // Min and max port for dynamic allocation
+	Timeout      time.Duration
+	Heartbeat    time.Duration
+	AuthTokens   []string   // Allowed authentication tokens
+	Compression  CompressionConfig // Compression settings
 }
 
 // DefaultServerConfig returns a default server configuration
@@ -132,6 +134,32 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	encoder := NewEncoder(conn)
 	decoder := NewDecoder(conn)
+
+	// If auth tokens are configured, require authentication
+	if len(s.config.AuthTokens) > 0 {
+		// Read auth message
+		msg, err := decoder.Decode()
+		if err != nil {
+			log.Printf("[Tunnel] Failed to read auth message: %v", err)
+			return
+		}
+
+		if msg.Type != MsgAuth {
+			log.Printf("[Tunnel] Expected auth message, got: %d", msg.Type)
+			encoder.Encode(NewErrorMessage(0, "authentication required"))
+			return
+		}
+
+		token := string(msg.Payload)
+		if !s.validateToken(token) {
+			log.Printf("[Tunnel] Invalid authentication token from %s", conn.RemoteAddr())
+			encoder.Encode(NewErrorMessage(0, "invalid token"))
+			return
+		}
+
+		encoder.Encode(NewAckMessage(ChannelIDControl))
+		log.Printf("[Tunnel] Client authenticated from %s", conn.RemoteAddr())
+	}
 
 	// Read registration message
 	msg, err := decoder.Decode()
@@ -251,6 +279,16 @@ func (s *Server) handleMessage(session *Session, msg *Message, encoder *Encoder)
 	default:
 		encoder.Encode(NewErrorMessage(msg.ChannelID, "unknown message type"))
 	}
+}
+
+// validateToken checks if the provided token is in the allowed list
+func (s *Server) validateToken(token string) bool {
+	for _, t := range s.config.AuthTokens {
+		if t == token {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) relayData(session *Session, ch *Channel, encoder *Encoder) {

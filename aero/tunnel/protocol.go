@@ -8,17 +8,18 @@ const Magic = 0xA1B2
 // 消息类型
 const (
 	MsgRegister   = 0x01 // Agent 注册
-	MsgOpenPort  = 0x02 // 请求开放端口
-	MsgClosePort = 0x03 // 关闭端口
-	MsgData      = 0x04  // 数据转发
-	MsgHeartbeat = 0x05  // 心跳
-	MsgAck       = 0x06  // 确认响应
-	MsgError     = 0x07  // 错误响应
-	MsgListPorts = 0x08  // 查询可用端口
+	MsgAuth       = 0x09 // 认证消息
+	MsgOpenPort   = 0x02 // 请求开放端口
+	MsgClosePort  = 0x03 // 关闭端口
+	MsgData       = 0x04 // 数据转发
+	MsgHeartbeat  = 0x05 // 心跳
+	MsgAck        = 0x06 // 确认响应
+	MsgError      = 0x07 // 错误响应
+	MsgListPorts  = 0x08 // 查询可用端口
 )
 
 // HeaderSize 控制消息头大小
-const HeaderSize = 15 // 2(Magic) + 1(Type) + 8(ChannelID) + 4(Length)
+const HeaderSize = 16 // 2(Magic) + 1(Type) + 8(ChannelID) + 1(Flags) + 4(Length)
 
 // ChannelID 特殊值
 const (
@@ -29,6 +30,7 @@ const (
 type Message struct {
 	Type      byte
 	ChannelID uint64
+	Flags     byte // bit 0 = compressed
 	Payload   []byte
 }
 
@@ -47,6 +49,15 @@ func NewRegisterMessage(agentID string) *Message {
 		Type:      MsgRegister,
 		ChannelID: ChannelIDControl,
 		Payload:   []byte(agentID),
+	}
+}
+
+// NewAuthMessage 创建认证消息
+func NewAuthMessage(token string) *Message {
+	return &Message{
+		Type:      MsgAuth,
+		ChannelID: ChannelIDControl,
+		Payload:   []byte(token),
 	}
 }
 

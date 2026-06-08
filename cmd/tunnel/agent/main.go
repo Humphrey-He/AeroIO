@@ -18,10 +18,15 @@ import (
 )
 
 var (
-	flagServer   = flag.String("server", "localhost:8888", "Tunnel server address")
-	flagAgentID  = flag.String("id", "", "Agent ID (auto-generated if empty)")
-	flagLocal    = flag.String("local", "", "Local service to expose (format: publicPort:target)")
-	flagMappings = flag.String("map", "", "Port mappings (format: public:local, comma separated)")
+	flagServer    = flag.String("server", "localhost:8888", "Tunnel server address")
+	flagAgentID   = flag.String("id", "", "Agent ID (auto-generated if empty)")
+	flagToken     = flag.String("token", "", "Authentication token")
+	flagLocal     = flag.String("local", "", "Local service to expose (format: publicPort:target)")
+	flagMappings  = flag.String("map", "", "Port mappings (format: public:local, comma separated)")
+	flagTransport = flag.String("transport", "tcp", "Transport type: tcp or websocket (with auto-fallback)")
+	flagWSPath    = flag.String("ws-path", "/tunnel", "WebSocket path (for websocket transport)")
+	flagUseTLS    = flag.Bool("tls", false, "Use TLS for WebSocket transport")
+	flagCompress  = flag.Bool("compress", false, "Enable traffic compression")
 )
 
 type LocalPortMapping struct {
@@ -31,6 +36,12 @@ type LocalPortMapping struct {
 
 func main() {
 	flag.Parse()
+
+	// Parse transport type
+	transportType, err := tunnel.ParseTransportType(*flagTransport)
+	if err != nil {
+		log.Fatalf("Invalid transport type: %v", err)
+	}
 
 	// Generate agent ID if not provided
 	agentID := *flagAgentID
@@ -77,29 +88,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create tunnel client
+	// Create tunnel config
 	config := tunnel.TunnelConfig{
 		ServerAddr: *flagServer,
 		AgentID:    agentID,
+		Token:      *flagToken,
 		Timeout:    30 * time.Second,
 		Heartbeat:  30 * time.Second,
+		Transport:  transportType,
+		WSPath:     *flagWSPath,
+		UseTLS:     *flagUseTLS,
 	}
 
-	client, err := tunnel.NewClient(config)
+	if *flagCompress {
+		config.Compression = tunnel.CompressionConfig{
+			Level:   tunnel.CompressionLevelDefault,
+			Enabled: true,
+		}
+		fmt.Printf("🔐 Compression enabled\n")
+	}
+
+	fmt.Printf("🔌 Connecting to tunnel server %s (transport: %s)...\n", *flagServer, transportType)
+
+	var client *tunnel.Client
+	var wsTransport *tunnel.WSTransport
+
+	// Try connecting with auto-fallback
+	client, wsTransport, err = tunnel.ClientWithAutoFallback(config)
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
-	}
-
-	// Connect to server
-	fmt.Println("🔌 Connecting to tunnel server...")
-	if err := client.Connect(); err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
-	fmt.Printf("✅ Connected as agent: %s\n", agentID)
+
+	var transportName string
+	if client != nil {
+		transportName = "TCP"
+		// Connect (already connected in ClientWithAutoFallback)
+		fmt.Printf("✅ Connected via TCP as agent: %s\n", agentID)
+	} else {
+		transportName = "WebSocket"
+		fmt.Printf("✅ Connected via WebSocket as agent: %s\n", agentID)
+	}
 
 	// Open ports
 	for _, mapping := range localPorts {
-		channelID, err := client.OpenPort(mapping.Public, mapping.Local)
+		var channelID uint64
+		var err error
+
+		if client != nil {
+			channelID, err = client.OpenPort(mapping.Public, mapping.Local)
+		} else {
+			channelID, err = wsTransport.OpenPort(mapping.Public, mapping.Local)
+		}
+
 		if err != nil {
 			log.Printf("Failed to open port %d: %v", mapping.Public, err)
 			continue
@@ -112,20 +152,28 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	// Start local proxies
-	go startLocalProxies(client, localPorts)
+	if client != nil {
+		go startLocalProxiesTCP(client, localPorts)
+	} else {
+		go startLocalProxiesWS(wsTransport, localPorts)
+	}
 
 	fmt.Println()
-	fmt.Println("Tunnel is active. Press Ctrl+C to disconnect.")
+	fmt.Printf("Tunnel is active via %s. Press Ctrl+C to disconnect.\n", transportName)
 	fmt.Println()
 
 	// Wait for shutdown
 	<-sigCh
 	fmt.Println("\n🛑 Disconnecting...")
-	client.Close()
+	if client != nil {
+		client.Close()
+	} else {
+		wsTransport.Close()
+	}
 	fmt.Println("Disconnected.")
 }
 
-func startLocalProxies(client *tunnel.Client, ports []LocalPortMapping) {
+func startLocalProxiesTCP(client *tunnel.Client, ports []LocalPortMapping) {
 	for _, mapping := range ports {
 		go func(m LocalPortMapping) {
 			listenAddr := fmt.Sprintf("127.0.0.1:%d", m.Public)
@@ -141,7 +189,7 @@ func startLocalProxies(client *tunnel.Client, ports []LocalPortMapping) {
 				if err != nil {
 					continue
 				}
-				go handleLocalConnection(client, localConn, m.Local)
+				go handleLocalConnectionTCP(client, localConn, m.Local)
 			}
 		}(mapping)
 	}
@@ -150,7 +198,51 @@ func startLocalProxies(client *tunnel.Client, ports []LocalPortMapping) {
 	select {}
 }
 
-func handleLocalConnection(client *tunnel.Client, localConn net.Conn, target string) {
+func startLocalProxiesWS(wsTransport *tunnel.WSTransport, ports []LocalPortMapping) {
+	for _, mapping := range ports {
+		go func(m LocalPortMapping) {
+			listenAddr := fmt.Sprintf("127.0.0.1:%d", m.Public)
+			ln, err := net.Listen("tcp", listenAddr)
+			if err != nil {
+				log.Printf("Failed to listen on %s: %v", listenAddr, err)
+				return
+			}
+			fmt.Printf("👂 Listening on %s for tunnel\n", listenAddr)
+
+			for {
+				localConn, err := ln.Accept()
+				if err != nil {
+					continue
+				}
+				go handleLocalConnectionWS(wsTransport, localConn, m.Local)
+			}
+		}(mapping)
+	}
+
+	// Block forever
+	select {}
+}
+
+func handleLocalConnectionTCP(client *tunnel.Client, localConn net.Conn, target string) {
+	defer localConn.Close()
+
+	// Connect to target
+	targetConn, err := net.DialTimeout("tcp", target, 5*time.Second)
+	if err != nil {
+		log.Printf("Failed to connect to target %s: %v", target, err)
+		return
+	}
+	defer targetConn.Close()
+
+	// Bidirectional copy
+	go func() {
+		io.Copy(targetConn, localConn)
+		targetConn.Close()
+	}()
+	io.Copy(localConn, targetConn)
+}
+
+func handleLocalConnectionWS(wsTransport *tunnel.WSTransport, localConn net.Conn, target string) {
 	defer localConn.Close()
 
 	// Connect to target

@@ -12,12 +12,119 @@ import (
 	"time"
 )
 
+// TransportType represents the type of tunnel transport
+type TransportType int
+
+const (
+	// TransportTCP uses raw TCP connection
+	TransportTCP TransportType = iota
+	// TransportWebSocket uses WebSocket connection
+	TransportWebSocket
+)
+
+// String returns the string representation of TransportType
+func (t TransportType) String() string {
+	switch t {
+	case TransportTCP:
+		return "tcp"
+	case TransportWebSocket:
+		return "websocket"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseTransportType parses a string to TransportType
+func ParseTransportType(s string) (TransportType, error) {
+	switch s {
+	case "tcp":
+		return TransportTCP, nil
+	case "websocket", "ws":
+		return TransportWebSocket, nil
+	default:
+		return TransportTCP, fmt.Errorf("unknown transport type: %s", s)
+	}
+}
+
 // TunnelConfig holds the configuration for a tunnel connection
 type TunnelConfig struct {
-	ServerAddr string
-	AgentID    string
-	Timeout    time.Duration
-	Heartbeat  time.Duration
+	ServerAddr  string
+	AgentID     string
+	Token       string // Authentication token
+	Timeout     time.Duration
+	Heartbeat   time.Duration
+	Transport   TransportType      // Transport type (TCP or WebSocket)
+	WSPath      string             // WebSocket path (for WebSocket transport)
+	UseTLS      bool               // Use TLS (for WebSocket transport)
+	Compression CompressionConfig // Compression settings
+}
+
+// ClientWithAutoFallback creates a client with automatic transport fallback.
+// It first tries the specified transport, then falls back to the alternative if it fails.
+func ClientWithAutoFallback(config TunnelConfig) (*Client, *WSTransport, error) {
+	var lastErr error
+
+	// Define transport order based on config
+	transports := []TransportType{config.Transport}
+	if config.Transport == TransportTCP {
+		transports = append(transports, TransportWebSocket)
+	} else {
+		transports = append(transports, TransportTCP)
+	}
+
+	for _, transport := range transports {
+		log.Printf("[Tunnel] Trying transport: %s", transport)
+
+		switch transport {
+		case TransportTCP:
+			// Create TCP client
+			tcpConfig := config
+			tcpClient, err := NewClient(tcpConfig)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			if err := tcpClient.Connect(); err != nil {
+				tcpClient.Close()
+				lastErr = err
+				log.Printf("[Tunnel] TCP connection failed: %v", err)
+				continue
+			}
+
+			log.Printf("[Tunnel] Connected via TCP successfully")
+			return tcpClient, nil, nil
+
+		case TransportWebSocket:
+			// Create WebSocket transport
+			wsConfig := WSTransportConfig{
+				ServerAddr: config.ServerAddr,
+				AgentID:    config.AgentID,
+				Timeout:    config.Timeout,
+				Heartbeat:  config.Heartbeat,
+				Path:       config.WSPath,
+				TLS:        config.UseTLS,
+			}
+
+			wsTransport, err := NewWSTransport(wsConfig)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			if err := wsTransport.Connect(); err != nil {
+				wsTransport.Close()
+				lastErr = err
+				log.Printf("[Tunnel] WebSocket connection failed: %v", err)
+				continue
+			}
+
+			log.Printf("[Tunnel] Connected via WebSocket successfully")
+			return nil, wsTransport, nil
+		}
+	}
+
+	return nil, nil, fmt.Errorf("all transports failed, last error: %w", lastErr)
 }
 
 // Client represents a tunnel client that connects to the server
@@ -74,6 +181,35 @@ func (c *Client) Connect() error {
 	c.encoder = NewEncoder(conn)
 	c.decoder = NewDecoder(conn)
 	c.running = true
+
+	// Send auth message if token is configured
+	if c.config.Token != "" {
+		if err := c.encoder.Encode(NewAuthMessage(c.config.Token)); err != nil {
+			conn.Close()
+			c.running = false
+			return fmt.Errorf("failed to send auth: %w", err)
+		}
+
+		// Wait for auth response
+		resp, err := c.decoder.Decode()
+		if err != nil {
+			conn.Close()
+			c.running = false
+			return fmt.Errorf("failed to read auth response: %w", err)
+		}
+
+		if resp.Type == MsgError {
+			conn.Close()
+			c.running = false
+			return fmt.Errorf("auth failed: %s", string(resp.Payload))
+		}
+
+		if resp.Type != MsgAck {
+			conn.Close()
+			c.running = false
+			return fmt.Errorf("unexpected auth response: %d", resp.Type)
+		}
+	}
 
 	// Send registration
 	if err := c.encoder.Encode(NewRegisterMessage(c.sessionID)); err != nil {
